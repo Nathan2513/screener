@@ -1,0 +1,53 @@
+name: Rapport quotidien RSI / MM50 / MM200
+
+on:
+  schedule:
+    # 21:30 UTC = 17:30 heure de New York en EDT (été) / 16:30 en EST (hiver).
+    # Comme le marché ferme à 16:00 ET, ce créneau tombe toujours APRES la
+    # clôture toute l'année (marge de 30 à 90 min pour que Yahoo Finance
+    # publie la bougie hebdo finale).
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch: {}   # permet de lancer le bot manuellement depuis l'onglet Actions
+
+# Empêche deux runs de tourner en même temps (ex: cron + lancement manuel).
+# Sans ça, deux runs concurrents peuvent chacun committer/push et se rentrer
+# dedans -> "non-fast-forward" / push rejeté.
+concurrency:
+  group: stock-scanner-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # nécessaire pour committer state.json
+
+jobs:
+  screener:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer le screener
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scripts/screener.py
+
+      - name: Committer le state.json mis à jour
+        run: |
+          git config user.name "stock-screener-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet && exit 0   # rien à committer -> on s'arrête là proprement
+          git commit -m "chore: update state.json [skip ci]"
+          # filet de sécurité : si origin/main a bougé entre le checkout et
+          # maintenant, on rebase notre commit dessus avant de pousser, au
+          # lieu de planter sur un push rejeté (non-fast-forward).
+          git pull --rebase origin main
+          git push
