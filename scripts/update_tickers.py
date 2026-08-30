@@ -4,16 +4,29 @@ A lancer périodiquement (workflow séparé, ex: 1x/mois) car ces listes
 changent peu souvent. Le screener quotidien lit tickers.json généré ici
 plutôt que de re-scraper Wikipedia à chaque run (plus rapide, plus fiable).
 """
+import io
 import json
 import sys
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 
 SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 NASDAQ100_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
 
 OUTPUT_PATH = "tickers.json"
+
+# Wikipedia renvoie une 403 Forbidden aux requêtes sans User-Agent de type
+# navigateur (ce que pandas.read_html envoie par défaut). On récupère donc
+# le HTML nous-mêmes avec un User-Agent explicite, puis on le passe à
+# pandas.read_html.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 
 def normalize(ticker: str) -> str:
@@ -21,15 +34,23 @@ def normalize(ticker: str) -> str:
     return ticker.strip().upper().replace(".", "-")
 
 
+def fetch_html(url: str) -> str:
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    return resp.text
+
+
 def fetch_sp500() -> set[str]:
-    tables = pd.read_html(SP500_URL)
+    html = fetch_html(SP500_URL)
+    tables = pd.read_html(io.StringIO(html))
     df = tables[0]
     col = "Symbol" if "Symbol" in df.columns else df.columns[0]
     return {normalize(t) for t in df[col].astype(str)}
 
 
 def fetch_nasdaq100() -> set[str]:
-    tables = pd.read_html(NASDAQ100_URL)
+    html = fetch_html(NASDAQ100_URL)
+    tables = pd.read_html(io.StringIO(html))
     # La table des composants change parfois d'index selon les éditions de la page,
     # on cherche celle qui contient une colonne Ticker/Symbol.
     for df in tables:
@@ -55,8 +76,6 @@ def main():
     all_tickers = sorted(t for t in (sp500 | nasdaq100) if t and t != "NAN")
 
     if len(all_tickers) < 400:
-        # Garde-fou: si le scraping a mal tourné (page Wikipedia changée etc.),
-        # on refuse d'écraser une bonne liste existante avec une liste incomplète.
         print(f"[ERROR] Seulement {len(all_tickers)} tickers trouvés, "
               f"c'est suspect (attendu ~600). Abandon, tickers.json non modifié.",
               file=sys.stderr)
