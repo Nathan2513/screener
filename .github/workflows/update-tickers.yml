@@ -1,0 +1,37 @@
+name: Mise à jour liste des tickers
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"   # le 1er de chaque mois à 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-tickers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Mettre à jour tickers.json
+        run: python scripts/update_tickers.py
+
+      - name: Committer tickers.json
+        run: |
+          git config user.name "stock-screener-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add tickers.json
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: refresh tickers list [skip ci]"
+          git pull --rebase origin main
+          git push
