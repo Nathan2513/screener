@@ -9,12 +9,15 @@ Pour chaque action :
 Une action déjà signalée cette semaine (même catégorie) n'est plus
 resignalée avant le lundi suivant (déduplication via state.json).
 
+Le rapport est généré en PDF (tableaux, triés par market cap décroissante) et
+envoyé en pièce jointe sur Discord, avec un court message texte en résumé.
+
 Variables d'environnement :
   DISCORD_WEBHOOK_URL   (obligatoire)
   RSI_THRESHOLD         défaut 35
   TOUCH_PCT             défaut 0.015 (1.5%)
   BATCH_SIZE            défaut 40
-  LOOKBACK_YEARS        défaut 6
+  LOOKBACK_YEARS         défaut 6
   SEND_EMPTY_REPORT     défaut "true"
 """
 import json
@@ -27,9 +30,17 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import yfinance as yf
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+)
 
 TICKERS_PATH = "tickers.json"
 STATE_PATH = "state.json"
+PDF_PATH = "report.pdf"
 
 RSI_THRESHOLD = float(os.environ.get("RSI_THRESHOLD", "35"))
 TOUCH_PCT = float(os.environ.get("TOUCH_PCT", "0.015"))
@@ -45,9 +56,15 @@ CAT_MM50 = "touch_mm50"
 CAT_MM200 = "touch_mm200"
 
 CAT_LABELS = {
-    CAT_RSI: f"🔴 RSI hebdo < {RSI_THRESHOLD:.0f}",
-    CAT_MM50: "🟠 Touche la MM50 hebdo",
-    CAT_MM200: "🔵 Touche la MM200 hebdo",
+    CAT_RSI: f"RSI hebdo < {RSI_THRESHOLD:.0f}",
+    CAT_MM50: "Touche la MM50 hebdo",
+    CAT_MM200: "Touche la MM200 hebdo",
+}
+
+CAT_EMOJIS = {
+    CAT_RSI: "🔴",
+    CAT_MM50: "🟠",
+    CAT_MM200: "🔵",
 }
 
 
@@ -156,7 +173,6 @@ def download_batch(tickers: list[str], retries: int = 2) -> dict:
             if t in data.columns.get_level_values(0):
                 result[t] = data[t]
     else:
-        # Un seul ticker dans le lot
         if len(tickers) == 1:
             result[tickers[0]] = data
     return result
@@ -169,8 +185,44 @@ def fetch_all(tickers: list[str]) -> dict:
         print(f"Téléchargement lot {i // BATCH_SIZE + 1} "
               f"({len(batch)} tickers)...")
         all_data.update(download_batch(batch))
-        time.sleep(1)  # petite pause pour ménager l'API Yahoo
+        time.sleep(1)
     return all_data
+
+
+def fetch_market_caps(tickers: list[str]) -> dict:
+    """Récupère la capitalisation boursière uniquement pour les tickers
+    passés en argument (typiquement : ceux qui ont un nouveau signal
+    aujourd'hui, donc une petite liste -> pas besoin de batcher)."""
+    caps = {}
+    for t in tickers:
+        try:
+            fi = yf.Ticker(t).fast_info
+            mc = None
+            for key in ("market_cap", "marketCap"):
+                try:
+                    val = fi[key]
+                    if val:
+                        mc = val
+                        break
+                except Exception:
+                    continue
+            caps[t] = float(mc) if mc else None
+        except Exception as e:
+            print(f"[WARN] Market cap indisponible pour {t}: {e}", file=sys.stderr)
+            caps[t] = None
+    return caps
+
+
+def format_market_cap(mc) -> str:
+    if not mc:
+        return "N/A"
+    if mc >= 1e12:
+        return f"{mc / 1e12:.2f}T$"
+    if mc >= 1e9:
+        return f"{mc / 1e9:.2f}B$"
+    if mc >= 1e6:
+        return f"{mc / 1e6:.1f}M$"
+    return f"{mc:.0f}$"
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +243,7 @@ def load_state(week_key: str) -> set:
     except (json.JSONDecodeError, OSError):
         return set()
     if state.get("week") != week_key:
-        return set()  # nouvelle semaine -> reset
+        return set()
     return set(state.get("sent", []))
 
 
@@ -201,67 +253,142 @@ def save_state(week_key: str, sent: set):
 
 
 # --------------------------------------------------------------------------
-# Rapport Discord
+# Génération du PDF
 # --------------------------------------------------------------------------
 
-def format_lines(signals: list[dict]) -> list[str]:
-    signals_sorted = sorted(signals, key=lambda s: s["sort_key"])
-    return [
-        f"**{s['ticker']}** — {s['price']:.2f}$ · {s['detail']}"
-        for s in signals_sorted
-    ]
+def make_table(data: list[list[str]]) -> Table:
+    t = Table(data, hAlign="LEFT",
+              colWidths=[2.3 * cm, 2.6 * cm, 2.2 * cm, None])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#f2f2f2")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return t
 
 
-def chunk_field_value(lines: list[str], max_chars: int = 1000) -> list[str]:
-    """Découpe une liste de lignes en blocs respectant la limite Discord
-    (1024 caractères par valeur de field)."""
-    chunks, current, current_len = [], [], 0
-    for line in lines:
-        if current_len + len(line) + 1 > max_chars and current:
-            chunks.append("\n".join(current))
-            current, current_len = [], 0
-        current.append(line)
-        current_len += len(line) + 1
-    if current:
-        chunks.append("\n".join(current))
-    return chunks or ["Aucun nouveau signal cette semaine."]
+def build_multi_signal_rows(new_signals_by_cat: dict) -> dict:
+    """Regroupe par ticker les catégories touchées, ne garde que ceux qui
+    valident 2 catégories ou plus."""
+    by_ticker = {}
+    for cat, sigs in new_signals_by_cat.items():
+        for s in sigs:
+            entry = by_ticker.setdefault(s["ticker"], {"cats": {}, "price": s["price"]})
+            entry["cats"][cat] = s["detail"]
+    return {t: d for t, d in by_ticker.items() if len(d["cats"]) >= 2}
 
 
-def build_embeds(new_signals_by_cat: dict, scanned: int, failed: int, now: datetime) -> list[dict]:
-    fields = []
+def esc(text: str) -> str:
+    """Echappe les caractères spéciaux XML pour les Paragraph reportlab
+    (reportlab interprète le contenu des Paragraph comme du XML/HTML léger,
+    donc '&', '<', '>' doivent être échappés pour s'afficher correctement)."""
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def build_pdf_report(new_signals_by_cat: dict, market_caps: dict,
+                      now: datetime, scanned: int, failed: int, out_path: str):
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(
+        out_path, pagesize=A4,
+        topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+    )
+    elements = []
+
+    elements.append(Paragraph(
+        f"Rapport hebdo RSI / MM50 / MM200 — {now.strftime('%d/%m/%Y')}",
+        styles["Title"]))
+    subtitle = esc(f"Scan Nasdaq-100 + S&P 500 · {scanned} actions analysées")
+    if failed:
+        subtitle += esc(f" · {failed} échecs de téléchargement")
+    elements.append(Paragraph(subtitle, styles["Normal"]))
+    elements.append(Paragraph(
+        "Une action n'est resignalée qu'une fois par semaine. "
+        "Classement par capitalisation boursière décroissante.",
+        styles["Italic"]))
+    elements.append(Spacer(1, 0.6 * cm))
+
+    # --- Tableau 1 : actions validant plusieurs indicateurs ---
+    multi = build_multi_signal_rows(new_signals_by_cat)
+    multi_sorted = sorted(
+        multi.items(),
+        key=lambda kv: (market_caps.get(kv[0]) or -1),
+        reverse=True,
+    )
+    elements.append(Paragraph("Actions validant plusieurs indicateurs", styles["Heading2"]))
+    if multi_sorted:
+        data = [["Ticker", "Market Cap", "Prix", "Indicateurs validés"]]
+        for ticker, d in multi_sorted:
+            cats_str = " + ".join(CAT_LABELS[c] for c in d["cats"])
+            data.append([ticker, format_market_cap(market_caps.get(ticker)),
+                         f"{d['price']:.2f}$", cats_str])
+        elements.append(make_table(data))
+    else:
+        elements.append(Paragraph("Aucune action ne valide plusieurs indicateurs aujourd'hui.",
+                                   styles["Normal"]))
+    elements.append(Spacer(1, 0.6 * cm))
+
+    # --- Un tableau par indicateur ---
     for cat in (CAT_RSI, CAT_MM50, CAT_MM200):
-        lines = format_lines(new_signals_by_cat.get(cat, []))
-        if not lines:
-            fields.append({
-                "name": CAT_LABELS[cat],
-                "value": "Aucun nouveau signal.",
-                "inline": False,
-            })
-            continue
-        chunks = chunk_field_value(lines)
-        for idx, chunk in enumerate(chunks):
-            label = CAT_LABELS[cat] if len(chunks) == 1 else f"{CAT_LABELS[cat]} ({idx + 1}/{len(chunks)})"
-            fields.append({"name": label, "value": chunk, "inline": False})
+        elements.append(Paragraph(CAT_LABELS[cat], styles["Heading2"]))
+        sigs = new_signals_by_cat.get(cat, [])
+        sigs_sorted = sorted(
+            sigs, key=lambda s: (market_caps.get(s["ticker"]) or -1), reverse=True
+        )
+        if sigs_sorted:
+            data = [["Ticker", "Market Cap", "Prix", "Détail"]]
+            for s in sigs_sorted:
+                data.append([s["ticker"], format_market_cap(market_caps.get(s["ticker"])),
+                             f"{s['price']:.2f}$", s["detail"]])
+            elements.append(make_table(data))
+        else:
+            elements.append(Paragraph("Aucun nouveau signal.", styles["Normal"]))
+        elements.append(Spacer(1, 0.5 * cm))
 
-    embed = {
-        "title": f"📊 Rapport hebdo RSI / MM50 / MM200 — {now.strftime('%d/%m/%Y')}",
-        "description": (
-            f"Scan Nasdaq-100 + S&P 500 · {scanned} actions analysées"
-            + (f" · {failed} échecs de téléchargement" if failed else "")
-            + "\n_Une action n'est resignalée qu'une fois par semaine._"
-        ),
-        "color": 0x2ecc71,
-        "fields": fields,
-        "footer": {"text": f"Clôture du {now.strftime('%d/%m/%Y')} (heure NY)"},
-    }
-    return [embed]
+    doc.build(elements)
 
 
-def send_discord(embeds: list[dict]):
+# --------------------------------------------------------------------------
+# Envoi Discord (PDF en pièce jointe)
+# --------------------------------------------------------------------------
+
+def build_summary_text(new_signals_by_cat: dict, multi_count: int,
+                        scanned: int, now: datetime) -> str:
+    counts = {cat: len(sigs) for cat, sigs in new_signals_by_cat.items()}
+    lines = [
+        f"📊 **Rapport hebdo RSI / MM50 / MM200 — {now.strftime('%d/%m/%Y')}**",
+        f"Scan Nasdaq-100 + S&P 500 · {scanned} actions analysées",
+        f"🏆 {multi_count} action(s) valident plusieurs indicateurs",
+        f"{CAT_EMOJIS[CAT_RSI]} {counts.get(CAT_RSI, 0)} nouveaux signaux RSI < {RSI_THRESHOLD:.0f} · "
+        f"{CAT_EMOJIS[CAT_MM50]} {counts.get(CAT_MM50, 0)} touchent la MM50 · "
+        f"{CAT_EMOJIS[CAT_MM200]} {counts.get(CAT_MM200, 0)} touchent la MM200",
+        "📎 Détail complet (tableaux triés par market cap) dans le PDF ci-dessous.",
+    ]
+    return "\n".join(lines)
+
+
+def send_discord_with_pdf(summary_text: str, pdf_path: str):
     if not DISCORD_WEBHOOK_URL:
         print("[ERROR] DISCORD_WEBHOOK_URL non défini.", file=sys.stderr)
         sys.exit(1)
-    resp = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": embeds}, timeout=15)
+    payload = {"content": summary_text}
+    with open(pdf_path, "rb") as f:
+        files = {"file": (os.path.basename(pdf_path), f, "application/pdf")}
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            data={"payload_json": json.dumps(payload)},
+            files=files,
+            timeout=30,
+        )
     if resp.status_code >= 300:
         print(f"[ERROR] Discord a répondu {resp.status_code}: {resp.text}", file=sys.stderr)
         sys.exit(1)
@@ -285,7 +412,7 @@ def main():
     print(f"{len(tickers)} tickers à analyser.")
 
     week_key = current_week_key(now)
-    already_sent = load_state(week_key)  # set de "TICKER:category"
+    already_sent = load_state(week_key)
 
     price_data = fetch_all(tickers)
     failed = len(tickers) - len(price_data)
@@ -317,9 +444,20 @@ def main():
         print("Aucun nouveau signal et SEND_EMPTY_REPORT=false -> pas d'envoi Discord.")
         return
 
-    embeds = build_embeds(new_signals_by_cat, scanned=len(price_data), failed=failed, now=now)
-    send_discord(embeds)
-    print("Rapport envoyé sur Discord.")
+    # Market cap uniquement pour les tickers concernés par un nouveau signal
+    signal_tickers = sorted({s["ticker"] for sigs in new_signals_by_cat.values() for s in sigs})
+    print(f"Récupération du market cap pour {len(signal_tickers)} ticker(s)...")
+    market_caps = fetch_market_caps(signal_tickers)
+
+    multi = build_multi_signal_rows(new_signals_by_cat)
+
+    build_pdf_report(new_signals_by_cat, market_caps, now,
+                      scanned=len(price_data), failed=failed, out_path=PDF_PATH)
+    print(f"PDF généré : {PDF_PATH}")
+
+    summary_text = build_summary_text(new_signals_by_cat, len(multi), len(price_data), now)
+    send_discord_with_pdf(summary_text, PDF_PATH)
+    print("Rapport envoyé sur Discord (PDF en pièce jointe).")
 
     save_state(week_key, already_sent | newly_sent)
     print(f"State sauvegardé ({STATE_PATH}), semaine {week_key}.")
