@@ -2,3 +2,4 @@ pandas>=2.2
 lxml>=5.0
 requests>=2.31
 yfinance>=0.2.40
+reportlab>=4.0
